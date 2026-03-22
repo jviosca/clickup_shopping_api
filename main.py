@@ -6,16 +6,16 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
-CLICKUP_SHOPPING_TASK_ID = os.getenv("CLICKUP_SHOPPING_TASK_ID")
-CLICKUP_SHOPPING_CHECKLIST = os.getenv("CLICKUP_SHOPPING_CHECKLIST", "Lista")
-CLICKUP_SHOPPING_API_KEY = os.getenv("CLICKUP_SHOPPING_API_KEY")
+CLICKUP_TASK_ID = os.getenv("CLICKUP_SHOPPING_TASK_ID")
+CLICKUP_CHECKLIST_NAME = os.getenv("CLICKUP_SHOPPING_CHECKLIST", "Lista")
+APP_API_KEY = os.getenv("CLICKUP_SHOPPING_API_KEY")
 
 if not CLICKUP_TOKEN:
     raise RuntimeError("Falta CLICKUP_TOKEN")
-if not CLICKUP_SHOPPING_TASK_ID:
-    raise RuntimeError("Falta CLICKUP_SHOPPING_TASK_ID")
-if not CLICKUP_SHOPPING_API_KEY:
-    raise RuntimeError("Falta CLICKUP_SHOPPING_API_KEY")
+if not CLICKUP_TASK_ID:
+    raise RuntimeError("Falta CLICKUP_TASK_ID")
+if not APP_API_KEY:
+    raise RuntimeError("Falta APP_API_KEY")
 
 CLICKUP_BASE = "https://api.clickup.com/api/v2"
 CLICKUP_HEADERS = {
@@ -44,11 +44,11 @@ async def get_task(task_id: str) -> dict:
     return resp.json()
 
 
-async def get_or_create_checklist(task_id: str, checklist_name: str) -> str:
+async def get_or_create_checklist(task_id: str, checklist_name: str) -> dict:
     task = await get_task(task_id)
     for checklist in task.get("checklists", []):
         if checklist.get("name", "").strip().lower() == checklist_name.strip().lower():
-            return checklist["id"]
+            return checklist
 
     url = f"{CLICKUP_BASE}/task/{task_id}/checklist"
     payload = {"name": checklist_name}
@@ -59,7 +59,31 @@ async def get_or_create_checklist(task_id: str, checklist_name: str) -> str:
         raise HTTPException(status_code=500, detail=f"Error creando checklist: {resp.text}")
 
     data = resp.json()
-    return data["checklist"]["id"] if "checklist" in data else data["id"]
+    return data.get("checklist", data)
+
+
+async def delete_resolved_items(checklist: dict) -> list[str]:
+    checklist_id = checklist["id"]
+    deleted = []
+    errors = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for item in checklist.get("items", []):
+            # En ClickUp suele venir como booleano resolved
+            if item.get("resolved") is True:
+                item_id = item["id"]
+                url = f"{CLICKUP_BASE}/checklist/{checklist_id}/checklist_item/{item_id}"
+                resp = await client.delete(url, headers=CLICKUP_HEADERS)
+                if resp.status_code >= 400:
+                    errors.append(f"{item.get('name', item_id)} -> {resp.status_code}: {resp.text}")
+                else:
+                    deleted.append(item.get("name", item_id))
+
+    if errors:
+        # No corto el proceso, pero dejo trazabilidad
+        print("Errores borrando items resueltos:", errors)
+
+    return deleted
 
 
 @app.post("/clickup/shopping-list")
@@ -67,7 +91,7 @@ async def add_shopping_list(
     req: ShoppingListRequest,
     x_api_key: str = Header(default="")
 ):
-    if x_api_key != CLICKUP_SHOPPING_API_KEY:
+    if x_api_key != APP_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     cleaned = []
@@ -84,8 +108,13 @@ async def add_shopping_list(
     if not cleaned:
         raise HTTPException(status_code=400, detail="No hay items válidos")
 
-    checklist_id = await get_or_create_checklist(CLICKUP_SHOPPING_TASK_ID, CLICKUP_SHOPPING_CHECKLIST)
+    checklist = await get_or_create_checklist(CLICKUP_TASK_ID, CLICKUP_CHECKLIST_NAME)
+    checklist_id = checklist["id"]
 
+    # 1) borrar solo los items marcados como hechos
+    deleted_resolved = await delete_resolved_items(checklist)
+
+    # 2) crear los nuevos items
     created = []
     errors = []
 
@@ -102,7 +131,9 @@ async def add_shopping_list(
 
     return {
         "ok": True,
-        "checklist_name": CLICKUP_SHOPPING_CHECKLIST,
+        "checklist_name": CLICKUP_CHECKLIST_NAME,
+        "deleted_resolved_count": len(deleted_resolved),
+        "deleted_resolved": deleted_resolved,
         "created_count": len(created),
         "created": created,
         "errors": errors,
