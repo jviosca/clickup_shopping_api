@@ -1,0 +1,8 @@
+# Ignorar todo
+*
+
+# Excepto (y el propio .gitignore para poder versionar estas reglas)
+!.gitignore
+!main.py
+!README.md
+!requirements.txt
